@@ -1,0 +1,9 @@
+{
+  "id": "com.lucbloom.slideshow",
+  "version": "1.0.0",
+  "vendor": "Luc Bloom",
+  "type": "web",
+  "main": "index.html",
+  "title": "Slideshow",
+  "icon": "icon.png"
+}
