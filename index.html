@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width,initial-scale=1" />
+	<title>LG webOS Slideshow</title>
+	<style>
+		html,body{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+		#app{position:relative;height:100%;width:100%;overflow:hidden;background:#000}
+
+		.layer{position:absolute;inset:0;background-size:cover;background-position:center center;background-repeat:no-repeat;opacity:0;transition:opacity 800ms ease}
+		.layer.visible{opacity:1}
+
+		#controls{position:absolute;left:12px;top:12px;z-index:40}
+		#msg{position:absolute;left:12px;bottom:12px;z-index:40;background:rgba(0,0,0,0.5);padding:8px 12px;border-radius:6px}
+
+		#settings{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:50;background:rgba(10,10,10,0.95);padding:18px;border-radius:10px;min-width:420px;box-shadow:0 6px 24px rgba(0,0,0,0.6)}
+		#settings.hidden{display:none}
+		#settings h2{margin:0 0 8px 0;font-size:18px}
+		.setting-row{display:flex;align-items:center;margin:8px 0;gap:8px}
+		.setting-row label{width:130px;color:#ccc;font-size:14px}
+		.setting-row input{flex:1;padding:8px;border-radius:6px;border:1px solid #333;background:#111;color:#fff}
+		#settings .note{color:#f55;margin-bottom:6px}
+		#settings button{padding:8px 12px;border-radius:6px;border:0;background:#2b7cff;color:#fff;cursor:pointer}
+
+		#pauseOverlay{position:absolute;left:50%;top:20%;transform:translateX(-50%);z-index:60;font-size:96px;display:none;pointer-events:none}
+		#pauseOverlay.visible{display:block}
+
+		#loadingSpinner{position:absolute;left:50%;top:60%;transform:translate(-50%,-50%);z-index:60;display:none}
+		#loadingSpinner.visible{display:block}
+
+		/* hint hidden by default; shown only when paused */
+		#hint{position:absolute;right:12px;bottom:12px;z-index:40;font-size:13px;opacity:0.8;display:none}
+		input:focus{outline:2px solid rgba(100,150,255,0.6)}
+		button{font-size:16px}
+		@media (max-width:600px){#settings{min-width:90%}}
+	</style>
+</head>
+<body>
+	<div id="app" tabindex="0">
+		<div id="layerA" class="layer"></div>
+		<div id="layerB" class="layer"></div>
+
+		<div id="pauseOverlay">⏸</div>
+		<div id="loadingSpinner">Loading…</div>
+
+		<div id="settings" class="hidden" role="dialog" aria-modal="true">
+			<h2>Slideshow settings</h2>
+			<div id="serverError" class="note" style="display:none">Server not responding</div>
+			<div class="setting-row">
+				<label for="ipInput">Server IP</label>
+				<input id="ipInput" type="text" placeholder="192.168.1.2" />
+			</div>
+			<div class="setting-row">
+				<label for="delayInput">Delay (seconds)</label>
+				<input id="delayInput" type="number" min="1" step="1" placeholder="Delay in seconds" />
+			</div>
+			<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+				<button id="cancelBtn">Cancel</button>
+				<button id="saveBtn">Start</button>
+			</div>
+		</div>
+
+		<div id="msg" aria-live="polite"></div>
+		<div id="hint">← previous/next →<br>OK: pause/settings<br>BACK: exit</div>
+	</div>
+
+	<script>
+	// --- Configuration/Storage keys
+	const STORAGE_IP_KEY = 'slideshow_server_ip';
+	const STORAGE_DELAY_KEY = 'slideshow_delay_sec';
+	const STORAGE_LASTID_KEY = 'slideshow_last_id';
+
+	// --- Loader timing tweaks
+	const SHOW_LOADING_MS = 800; // show spinner only after this delay (prevents flash)
+	const MAX_LOAD_MS = 4000;   // give up this attempt after this many ms
+
+	// --- Elements
+	const app = document.getElementById('app');
+	const layerA = document.getElementById('layerA');
+	const layerB = document.getElementById('layerB');
+	const pauseOverlay = document.getElementById('pauseOverlay');
+	const loadingSpinner = document.getElementById('loadingSpinner');
+	const settingsEl = document.getElementById('settings');
+	const serverErrorEl = document.getElementById('serverError');
+	const ipInput = document.getElementById('ipInput');
+	const delayInput = document.getElementById('delayInput');
+	const saveBtn = document.getElementById('saveBtn');
+	const cancelBtn = document.getElementById('cancelBtn');
+	const msgEl = document.getElementById('msg');
+	const hintEl = document.getElementById('hint');
+
+	// --- State
+	let serverIP = '';
+	let delaySec = 5;
+	let currentId = 0;
+	let autoTimer = null;
+	let paused = false;
+	let visibleLayer = 0;
+	let pendingLoad = null; // will store {id, attempts, img, showTimer, maxTimer, deadline}
+
+	function saveSettings(ip, delay) {
+		localStorage.setItem(STORAGE_IP_KEY, ip);
+		localStorage.setItem(STORAGE_DELAY_KEY, String(delay));
+	}
+	function loadSettings() {
+		return {
+			ip: localStorage.getItem(STORAGE_IP_KEY) || '',
+			delay: parseInt(localStorage.getItem(STORAGE_DELAY_KEY),10) || 5
+		};
+	}
+
+	function saveLastId(id) { localStorage.setItem(STORAGE_LASTID_KEY, String(id)); }
+	function loadLastId() { const v = parseInt(localStorage.getItem(STORAGE_LASTID_KEY),10); return Number.isFinite(v) ? v : null; }
+
+	function showSettings(message) {
+		if (message) { serverErrorEl.style.display = 'block'; serverErrorEl.textContent = message; }
+		else { serverErrorEl.style.display = 'none'; }
+		const s = loadSettings();
+		ipInput.value = s.ip || '';
+		delayInput.value = s.delay || 5;
+		settingsEl.classList.remove('hidden');
+		paused = true; updatePauseUI();
+		app.focus();
+	}
+	function hideSettings() { settingsEl.classList.add('hidden'); serverErrorEl.style.display='none'; }
+
+	function updateMessage(t) { msgEl.textContent = t; }
+
+	function updatePauseUI() {
+		if (paused) {
+			pauseOverlay.classList.add('visible');
+			hintEl.style.display = 'block';
+		} else {
+			pauseOverlay.classList.remove('visible');
+			hintEl.style.display = 'none';
+		}
+	}
+
+	function buildImageUrl(id) {
+		return 'http://' + serverIP + ':1919/photos/' + id;
+	}
+
+	function setVisibleBackground(layerEl, url) {
+		layerEl.style.backgroundImage = `url("${url}")`;
+	}
+
+	function swapToLayer(n) {
+		if (n===0) { layerA.classList.add('visible'); layerB.classList.remove('visible'); visibleLayer = 0; }
+		else { layerB.classList.add('visible'); layerA.classList.remove('visible'); visibleLayer = 1; }
+	}
+
+	function showImmediateImage(id) {
+		// load and display immediately (used for manual next/prev)
+		attemptLoadAndShow(id, /*deadlineMs*/ Date.now() + (delaySec*1000) - 200, /*allowFallbackToSettings*/ true);
+	}
+
+	function clearPendingTimers(pl) {
+		if (!pl) return;
+		if (pl.showTimer) {
+			clearTimeout(pl.showTimer);
+			pl.showTimer = null;
+		}
+		if (pl.maxTimer) {
+			clearTimeout(pl.maxTimer);
+			pl.maxTimer = null;
+		}
+	}
+
+	function hideSpinnerAndClearPending() {
+		loadingSpinner.classList.remove('visible');
+		// clear pendingLoad timers if any
+		if (pendingLoad) {
+			clearPendingTimers(pendingLoad);
+			pendingLoad = null;
+		}
+	}
+
+	function attemptLoadAndShow(id, deadlineMs, allowFallbackToSettings) {
+		// cancel previous pending attempt
+		if (pendingLoad && pendingLoad.img) {
+			pendingLoad.img.onload = pendingLoad.img.onerror = null;
+			clearPendingTimers(pendingLoad);
+		}
+		pendingLoad = { id, attempts:0, img: null, deadline: deadlineMs, showTimer: null, maxTimer: null };
+
+		const tryLoad = () => {
+			// if deadline already passed, abort
+			if (Date.now() > pendingLoad.deadline) {
+				clearPendingTimers(pendingLoad);
+				pendingLoad = null;
+				loadingSpinner.classList.remove('visible');
+				updateMessage('');
+				return false;
+			}
+			pendingLoad.attempts++;
+			const img = new Image(); pendingLoad.img = img;
+			let completed = false;
+
+			// schedule spinner to appear only after SHOW_LOADING_MS
+			pendingLoad.showTimer = setTimeout(()=>{
+				loadingSpinner.classList.add('visible');
+				pendingLoad.showTimer = null;
+			}, SHOW_LOADING_MS);
+
+			// enforce a hard max timeout for this attempt
+			const remainingForMax = Math.min(MAX_LOAD_MS, Math.max(0, pendingLoad.deadline - Date.now()));
+			pendingLoad.maxTimer = setTimeout(()=>{
+				if (completed) return;
+				completed = true;
+				// stop load
+				try { img.onload = img.onerror = null; } catch(e){}
+				loadingSpinner.classList.remove('visible');
+				clearPendingTimers(pendingLoad);
+				pendingLoad = null;
+				updateMessage('');
+				if (allowFallbackToSettings) { showSettings('Server not responding'); }
+			}, remainingForMax);
+
+			img.onload = () => {
+				if (completed) return;
+				completed = true;
+				// success: clear timers and show
+				clearPendingTimers(pendingLoad);
+				loadingSpinner.classList.remove('visible');
+				pendingLoad.img = null;
+				const url = buildImageUrl(id);
+				const inactiveLayer = (visibleLayer===0)?layerB:layerA;
+				setVisibleBackground(inactiveLayer, url);
+				requestAnimationFrame(()=>{ swapToLayer((visibleLayer===0)?1:0); });
+				currentId = id; saveLastId(currentId);
+				pendingLoad = null;
+				updateMessage('');
+			};
+			img.onerror = () => {
+				if (completed) return;
+				completed = true;
+				// failed this attempt
+				clearPendingTimers(pendingLoad);
+				loadingSpinner.classList.remove('visible');
+				pendingLoad = null;
+				updateMessage('');
+				// retry once quickly if within deadline
+				if (pendingLoad === null && Date.now() < deadlineMs && pendingLoad?.attempts < 2) {
+					/* unreachable because we cleared pendingLoad; keep logic simple by retrying directly */
+				}
+				// If first load (startup) failed and fallback allowed, open settings
+				if (allowFallbackToSettings) { showSettings('Server not responding'); }
+			};
+			// append cache-busting on retries
+			const src = buildImageUrl(id) + (pendingLoad.attempts>1?('?r='+Date.now()):'');
+			img.src = src;
+			return true;
+		};
+
+		// Start the first try immediately
+		tryLoad();
+	}
+
+	function startAutoTimer() {
+		stopAutoTimer();
+		autoTimer = setInterval(()=>{
+			if (paused) return; // shouldn't occur but safe
+			const nextId = currentId + 1;
+			const deadline = Date.now() + (delaySec*1000) - 200;
+			// attempt to load and show; if it doesn't load before deadline it'll give up
+			attemptLoadAndShow(nextId, deadline, /*allowFallbackToSettings*/ false);
+		}, delaySec*1000);
+	}
+	function stopAutoTimer() { if (autoTimer) { clearInterval(autoTimer); autoTimer = null; } }
+
+	function togglePause() {
+		paused = !paused;
+		updatePauseUI();
+		if (paused) {
+			stopAutoTimer();
+			showSettings();
+		} else {
+			hideSettings();
+			startAutoTimer();
+		}
+	}
+
+	// Remote/back/keyboard handling
+	function tryExitApp() {
+		// Try common TV app exit methods; not guaranteed for all environments
+		try {
+			if (typeof tizen !== 'undefined' && tizen.application && tizen.application.getCurrentApplication) {
+				tizen.application.getCurrentApplication().exit();
+				return;
+			}
+		} catch(e) {}
+		try {
+			if (typeof webOS !== 'undefined' && webOS.platformBack) {
+				webOS.platformBack();
+				return;
+			}
+		} catch(e) {}
+		try {
+			window.close();
+		} catch(e) {}
+		// fallback: navigate to about:blank
+		document.location.href = 'about:blank';
+	}
+
+	function onKey(e) {
+		const code = e.keyCode || e.which;
+		// Left: 37, Right:39, Enter:13, Return/Back: 8,27,10009,461
+		if (code === 37) { // left
+			e.preventDefault(); prevPhoto();
+		} else if (code === 39) { // right
+			e.preventDefault(); nextPhoto();
+		} else if (code === 13) { // enter/ok
+			e.preventDefault(); // toggle pause / settings
+			if (paused) { paused=false; hideSettings(); startAutoTimer(); updatePauseUI(); }
+			else { paused=true; updatePauseUI(); showSettings(); }
+		} else if ([8,27,10009,461].includes(code)) {
+			// back/return
+			e.preventDefault(); // if settings visible hide it; otherwise exit
+			if (!settingsEl.classList.contains('hidden')) {
+				hideSettings(); paused=false; updatePauseUI(); // resume
+				startAutoTimer();
+			} else {
+				tryExitApp();
+			}
+		}
+	}
+
+	function nextPhoto() {
+		const id = currentId + 1;
+		showImmediateImage(id);
+	}
+	function prevPhoto() {
+		const id = currentId - 1;
+		showImmediateImage(id);
+	}
+
+	// --- Initial startup flow
+	function pingServerAndStart(onOk, onFail) {
+		const probeId = 1;
+		const testImg = new Image();
+		let done=false;
+		const timeout = setTimeout(()=>{
+			if (done) return;
+			done=true;
+			testImg.onload=testImg.onerror=null;
+			onFail();
+		}, 3000);
+		testImg.onload = ()=>{
+			if (done) return;
+			done=true;
+			clearTimeout(timeout);
+			testImg.onload=testImg.onerror=null;
+			onOk();
+		};
+		testImg.onerror = ()=>{
+			if (done) return;
+			done=true;
+			clearTimeout(timeout);
+			testImg.onload=testImg.onerror=null;
+			onFail();
+		};
+		testImg.src = buildImageUrl(probeId) + '?r=' + Date.now();
+	}
+
+	function setIPSetting(ip) {
+		serverIP = (ip || '').trim();
+	}
+
+	function setDelaySetting(delay) {
+		delaySec = Math.max(1, Math.floor(delay));
+	}
+
+	function startSlideshow() {
+		// if we have a stored last id use it, else random start
+		const last = loadLastId();
+		if (last !== null) currentId = last;
+		else currentId = Math.floor(Math.random()*10000) + 1;
+		// attempt to preload initial image and if success start timer
+		attemptLoadAndShow(currentId, Date.now() + (delaySec*1000) - 200, /*allowFallbackToSettings*/ true);
+		startAutoTimer();
+	}
+
+	// --- UI events
+	saveBtn.addEventListener('click', ()=>{
+		setIPSetting(ipInput.value.trim());
+		setDelaySetting(parseInt(delayInput.value, 10) || 5);
+		updateMessage('Checking server...');
+		pingServerAndStart(()=>{
+			// ok
+			saveSettings(serverIP,delaySec);
+			hideSettings(); paused=false; updatePauseUI();
+			startSlideshow();
+			updateMessage('');
+		}, ()=>{
+			// fail
+			updateMessage('');
+			showSettings('Server not responding');
+		});
+	});
+	cancelBtn.addEventListener('click', ()=>{
+		if (settingsEl.classList.contains('hidden')) return;
+		hideSettings();
+		paused=false; updatePauseUI();
+		startAutoTimer();
+	});
+
+	// keyboard/remote capture
+	document.addEventListener('keydown', onKey);
+
+	// prevent clicks inside settings from bubbling to the app
+	settingsEl.addEventListener('click', (e)=>{ e.stopPropagation(); });
+
+	// click in screensaver area: open pause/settings (only when settings hidden)
+	app.addEventListener('click', (e)=>{
+		if (settingsEl.classList.contains('hidden') && !paused) {
+			paused = true;
+			stopAutoTimer();
+			updatePauseUI();
+			showSettings();
+		}
+	});
+
+	// focus to receive keys
+	setTimeout(()=>{ app.focus(); },200);
+
+	// --- Boot
+	(function boot() {
+		const s = loadSettings();
+		if (!s.ip) {
+			// no stored ip -> show settings
+			showSettings();
+			return;
+		}
+		// we have stored ip; test it
+		setIPSetting(s.ip);
+		setDelaySetting(s.delay);
+		updateMessage('Checking saved server...');
+		pingServerAndStart(()=>{
+			updateMessage('');
+			startSlideshow();
+		}, ()=>{
+			updateMessage('');
+			showSettings('Server not responding');
+		});
+	})();
+
+	</script>
+</body>
+</html>
